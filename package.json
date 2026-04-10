@@ -4,7 +4,7 @@
   "description": "React Native transparent video player with alpha channel (alpha-packing) support. It works on iOS and Android (with looping funcionality).",
   "main": "lib/commonjs/index",
   "module": "lib/module/index",
-  "types": "src/index.d.ts",
+  "types": "lib/typescript/src/index.d.ts",
   "react-native": "src/index",
   "source": "src/index",
   "files": [
@@ -12,7 +12,6 @@
     "lib",
     "android",
     "ios",
-    "cpp",
     "*.podspec",
     "!lib/typescript/example",
     "!ios/build",
@@ -156,5 +155,13 @@
         }
       ]
     ]
+  },
+  "codegenConfig": {
+    "name": "TransparentVideoViewSpec",
+    "type": "components",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.transparentvideo"
+    }
   }
 }

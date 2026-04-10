@@ -30,74 +30,37 @@ public class AVPlayerView: UIView {
     
     private var playerItemStatusObserver: NSKeyValueObservation?
 
-    private(set) var playerItem: AVPlayerItem? = nil {
-        didSet {
-            // If `isLoopingEnabled` is called before the AVPlayer was set
-            setupLooping()
-        }
-    }
+    private(set) var playerItem: AVPlayerItem? = nil
     
     public func loadPlayerItem(_ playerItem: AVPlayerItem, onReady: ((Result<AVPlayer, Error>) -> Void)? = nil) {
+        // Cancel previous observation before setting up a new player
+        playerItemStatusObserver = nil
+
         let player = AVPlayer(playerItem: playerItem)
 
         self.player = player
         self.playerItem = playerItem
 
         guard let completion = onReady else {
-            playerItemStatusObserver = nil
             return
         }
 
         playerItemStatusObserver = playerItem.observe(\.status) { [weak self] item, _ in
+            guard self?.playerItem === item else { return }
             switch item.status {
             case .failed:
-                completion(.failure(item.error!))
+                let error = item.error ?? NSError(domain: "AVPlayerView", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unknown playback error"])
+                completion(.failure(error))
+                self?.playerItemStatusObserver = nil
             case .readyToPlay:
                 completion(.success(player))
-                // Stop observing
                 self?.playerItemStatusObserver = nil
             case .unknown:
                 break
             @unknown default:
-                fatalError()
+                break
             }
         }
     }
     
-    // MARK: - Looping Handler
-    
-    /// When set to `true`, the player view automatically adds an observer on its AVPlayer,
-    /// and it will play again from start every time playback ends.
-    /// * Warning: This will not result in a smooth video loop.
-    public var isLoopingEnabled: Bool = false {
-        didSet { setupLooping() }
-    }
-    
-    private var didPlayToEndTimeObsever: NSObjectProtocol? = nil {
-        willSet(newObserver) {
-            // When updating didPlayToEndTimeObserver,
-            // automatically remove its previous value from the Notification Center
-            if let observer = didPlayToEndTimeObsever, didPlayToEndTimeObsever !== newObserver {
-                NotificationCenter.default.removeObserver(observer)
-            }
-        }
-    }
-    
-    private func setupLooping() {
-        guard let playerItem = self.playerItem, let player = self.player else {
-            return
-        }
-        
-        guard isLoopingEnabled else {
-            didPlayToEndTimeObsever = nil
-            return
-        }
-        
-        didPlayToEndTimeObsever = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime, object: playerItem, queue: nil, using: { _ in
-                player.seek(to: CMTime.zero) { _ in
-                    player.play()
-                }
-        })
-    }
 }

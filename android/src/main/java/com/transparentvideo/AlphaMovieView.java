@@ -17,106 +17,53 @@
 package com.transparentvideo;
 
 import android.annotation.SuppressLint;
-import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
-import android.content.res.TypedArray;
-import android.graphics.Color;
-import android.media.MediaDataSource;
-import android.media.MediaMetadataRetriever;
+
 import android.media.MediaPlayer;
-import android.net.Uri;
-import android.os.Build;
-import android.os.Handler;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.view.Surface;
-import android.view.View;
-import android.view.ViewGroup;
-import android.widget.LinearLayout;
 
-import java.io.FileDescriptor;
 import java.io.IOException;
-import java.util.HashMap;
+
 
 @SuppressLint("ViewConstructor")
 public class AlphaMovieView extends GLTextureView {
 
     private static final int GL_CONTEXT_VERSION = 2;
 
-    private static final int NOT_DEFINED = -1;
-    private static final int NOT_DEFINED_COLOR = 0;
-    private static final int TIME_DETECTION_INTERVAL_MS = 100;
-
     private static final String TAG = "VideoSurfaceView";
 
-    private static final float VIEW_ASPECT_RATIO = 4f / 3f;
-    private float videoAspectRatio = VIEW_ASPECT_RATIO;
-
-    VideoRenderer renderer;
+    private VideoRenderer renderer;
     private MediaPlayer mediaPlayer;
 
-    private OnVideoStartedListener onVideoStartedListener;
     private OnVideoEndedListener onVideoEndedListener;
 
     private boolean isSurfaceCreated;
     private boolean isDataSourceSet;
-
-    private float accuracy;
-    private int alphaColor;
-    private boolean isPacked;
-    // When loopStartMs >= 0 and loopEndMs == -1, the video will jump back to loopStartMs
-    // once it reaches the end of the video.
-    private long loopStartMs; // -1 means no specific loop points will be set
-    private long loopEndMs; //numeros largos
-    // This should be populated with a MediaPlayer.SEEK_* constant
-    // Only for API 26 and above
-    private int loopSeekingMethod = 0; //numeros
-    private String shader; //letras y numeros
-
-    private boolean autoPlayAfterResume;//si o no
-    private boolean playAfterResume;
-
     private PlayerState state = PlayerState.NOT_PREPARED;
 
-    private boolean shouldLoop;
+    private boolean shouldLoop = true;
 
-    final Handler handler = new Handler();
-    final Runnable timeDetector = new Runnable() {
-        public void run() {
-            if (getRootView() == null) {
-                return;
-            }
-            try {
-                int currentTimeMs = mediaPlayer.getCurrentPosition();
-                if (state == PlayerState.STARTED) {
-                    startTimeDetector();
-                } else {
-                    return;
-                }
-                if (loopStartMs >= 0 && loopEndMs >= 0 && currentTimeMs >= loopEndMs) {
-                    // Handle looping when both loop start and end points are defined
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        mediaPlayer.seekTo(loopStartMs, loopSeekingMethod);
-                    } else {
-                        mediaPlayer.seekTo((int) loopStartMs);
-                    }
-                }
-            } catch (Exception exception) {
-                Log.e("AlphaMovieView", "Time detector error. Did you forget to call AlphaMovieView's onPause in the containing fragment/activity? | " + exception.getMessage());
-            }
-        }
-    };
+    private float volume = 1.0f;
+    private boolean muted = false;
+    private boolean startPaused = false;
+    private boolean autoplay = true;
+    private boolean wasPlayingBeforePause = false;
+
+    private OnVideoLoadedListener onVideoLoadedListener;
+    private OnVideoErrorListener onVideoErrorListener;
 
     public AlphaMovieView(Context context, AttributeSet attrs) {
         super(context, attrs);
 
         if (!isInEditMode()) {
-            init(attrs);
+            init();
         }
     }
 
-    private void init(AttributeSet attrs) {
+    private void init() {
         setEGLContextClientVersion(GL_CONTEXT_VERSION);
         setEGLConfigChooser(8, 8, 8, 8, 16, 0);
 
@@ -124,10 +71,10 @@ public class AlphaMovieView extends GLTextureView {
 
         renderer = new VideoRenderer();
 
-        obtainRendererOptions(attrs);
-
         this.addOnSurfacePrepareListener();
+        renderer.setGLTextureView(this);
         setRenderer(renderer);
+        setRenderMode(RENDERMODE_WHEN_DIRTY);
 
         bringToFront();
         setPreserveEGLContextOnPause(true);
@@ -136,65 +83,38 @@ public class AlphaMovieView extends GLTextureView {
 
     private void initMediaPlayer() {
         mediaPlayer = new MediaPlayer();
-        setScreenOnWhilePlaying(true);
-        setLooping(shouldLoop);
+        mediaPlayer.setScreenOnWhilePlaying(true);
+        applyVolume();
+        // Loop is handled manually in onCompletion to always emit onEnd
         mediaPlayer.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
             @Override
             public void onCompletion(MediaPlayer mp) {
                 if (onVideoEndedListener != null) {
                     onVideoEndedListener.onVideoEnded();
                 }
-                if (loopStartMs >= 0 && loopEndMs == -1) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        mediaPlayer.seekTo(loopStartMs, loopSeekingMethod);
-                    } else {
-                        mediaPlayer.seekTo((int) loopStartMs);
-                    }
-                    mediaPlayer.start();
-                    return;
-                } 
-                else if (loopStartMs == -1 && loopEndMs == -1 && shouldLoop) {
-                    mediaPlayer.seekTo(0);
-                    mediaPlayer.start();
-                    return;
+                if (shouldLoop) {
+                    mp.seekTo(0);
+                    mp.start();
+                } else {
+                    state = PlayerState.PAUSED;
                 }
-                state = PlayerState.PAUSED;
+            }
+        });
+        mediaPlayer.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+            @Override
+            public boolean onError(MediaPlayer mp, int what, int extra) {
+                if (onVideoErrorListener != null) {
+                    onVideoErrorListener.onVideoError("MediaPlayer error: what=" + what + " extra=" + extra);
+                }
+                return true;
             }
         });
     }
 
-    private void obtainRendererOptions(AttributeSet attrs) {
-        //if (attrs != null) {
-            TypedArray arr = getContext().obtainStyledAttributes(attrs, R.styleable.AlphaMovieView);
-            this.accuracy = arr.getFloat(R.styleable.AlphaMovieView_accuracy, 0.95f);
-            this.alphaColor = arr.getColor(R.styleable.AlphaMovieView_alphaColor, Color.argb(1,0,255,0));
-            this.autoPlayAfterResume = arr.getBoolean(R.styleable.AlphaMovieView_autoPlayAfterResume, false);
-            this.isPacked = arr.getBoolean(R.styleable.AlphaMovieView_packed, false);
-            this.loopStartMs = arr.getInteger(R.styleable.AlphaMovieView_loopStartMs, -1);
-            this.loopEndMs = arr.getInteger(R.styleable.AlphaMovieView_loopEndMs, -1);
-            this.shouldLoop = arr.getBoolean(R.styleable.AlphaMovieView_loop, true);
-            updateMediaPlayerLoopSetting();
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                this.loopSeekingMethod = arr.getInteger(R.styleable.AlphaMovieView_loopSeekingMethod, MediaPlayer.SEEK_CLOSEST_SYNC);
-            } else {
-                this.loopSeekingMethod = 0;
-            }
-            this.shader = arr.getString(R.styleable.AlphaMovieView_shader);
-            arr.recycle();
-            updateRendererOptions();
-       // }
-    }
-
-    private void updateRendererOptions() {
-        renderer.setPacked(isPacked);
-        if (alphaColor != NOT_DEFINED_COLOR) {
-            renderer.setAlphaColor(alphaColor);
-        }
-        if (shader != null) {
-            renderer.setCustomShader(shader);
-        }
-        if (accuracy != NOT_DEFINED) {
-            renderer.setAccuracy(accuracy);
+    private void applyVolume() {
+        if (mediaPlayer != null && state != PlayerState.RELEASE) {
+            float effectiveVolume = muted ? 0f : volume;
+            mediaPlayer.setVolume(effectiveVolume, effectiveVolume);
         }
     }
 
@@ -218,211 +138,72 @@ public class AlphaMovieView extends GLTextureView {
         prepareAsync(new MediaPlayer.OnPreparedListener() {
             @Override
             public void onPrepared(MediaPlayer mp) {
-                start();
+                applyVolume();
+                if (onVideoLoadedListener != null) {
+                    onVideoLoadedListener.onVideoLoaded();
+                }
+                // paused takes priority over autoplay
+                if (startPaused) {
+                    return;
+                }
+                if (autoplay) {
+                    start();
+                }
             }
         });
     }
 
-    private void calculateVideoAspectRatio(int videoWidth, int videoHeight) {
-        if (videoWidth > 0 && videoHeight > 0) {
-            videoAspectRatio = (float) videoWidth / videoHeight;
-        }
-
-        requestLayout();
-        invalidate();
-    }
-
-    @Override
-    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-        int widthMode = View.MeasureSpec.getMode(widthMeasureSpec);
-        int heightMode = View.MeasureSpec.getMode(heightMeasureSpec);
-        int widthSize = View.MeasureSpec.getSize(widthMeasureSpec);
-        int heightSize = View.MeasureSpec.getSize(heightMeasureSpec);
-
-        double currentAspectRatio = (double) widthSize / heightSize;
-        if (currentAspectRatio > videoAspectRatio) {
-            widthSize = (int) (heightSize * videoAspectRatio);
-        } else {
-            heightSize = (int) (widthSize / videoAspectRatio);
-        }
-
-        super.onMeasure(View.MeasureSpec.makeMeasureSpec(widthSize, widthMode),
-                View.MeasureSpec.makeMeasureSpec(heightSize, heightMode));
-    }
-
-    private void onDataSourceSet(MediaMetadataRetriever retriever) {
-        int videoWidth = Integer.parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
-        int videoHeight = Integer.parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
-        if (isPacked) {
-            // Packed videos are assumed to be contain the alpha channel on the right side of the
-            // original video, so the actual video width is half of the whole video
-            videoHeight /= 2.0f;
-        }
-
-        calculateVideoAspectRatio(videoWidth, videoHeight);
-        isDataSourceSet = true;
-
-        if (isSurfaceCreated) {
-            prepareAndStartMediaPlayer();
-        }
-    }
-
-    public void setAutoPlayAfterResume(boolean autoPlayAfterResume) {
-        this.autoPlayAfterResume = autoPlayAfterResume;
-    }
-
-    public void setPacked(boolean isPacked) {
-        this.isPacked = isPacked;
-        renderer.setPacked(isPacked);
-        updateRendererOptions();
-        renderer.refreshShader();
-    }
-
-    private void updateMediaPlayerLoopSetting() {
-        if (!shouldLoop && (loopStartMs >= 0 || loopEndMs >= 0)) {
-            // Disable MediaPlayer's built in looping if manual loop section is specified
-            setLooping(false);
-        } else {
-            setLooping(shouldLoop); // fallback to normal looping
-        }
-    }
-
-    // Sets the start point of a loop. If >= 0, will override any setting set via mediaPlayer.setLooping
-    public void setLoopStartMs(long startMs) {
-        this.loopStartMs = startMs;
-        updateMediaPlayerLoopSetting();
-    }
-
-    // Sets the end point of a loop. If >= 0, will override any setting set via mediaPlayer.setLooping
-    public void setLoopEndMs(long endMs) {
-        this.loopEndMs = endMs;
-        updateMediaPlayerLoopSetting();
-    }
-
-    public void setVideoFromAssets(String assetsFileName) {
-        reset();
-
-        try {
-            AssetFileDescriptor assetFileDescriptor = getContext().getAssets().openFd(assetsFileName);
-            mediaPlayer.setDataSource(assetFileDescriptor.getFileDescriptor(), assetFileDescriptor.getStartOffset(), assetFileDescriptor.getLength());
-
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            retriever.setDataSource(assetFileDescriptor.getFileDescriptor(), assetFileDescriptor.getStartOffset(), assetFileDescriptor.getLength());
-
-            onDataSourceSet(retriever);
-
-        } catch (IOException e) {
-            Log.e(TAG, e.getMessage(), e);
-        }
-    }
-
-    public void setVideoFromAssets(String assetsFileName, boolean isPacked) {
-        setPacked(isPacked);
-        setVideoFromAssets(assetsFileName);
-    }
 
     public void setVideoByUrl(String url) {
         reset();
 
         try {
             mediaPlayer.setDataSource(url);
-
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            retriever.setDataSource(url, new HashMap<String, String>());
-
-            onDataSourceSet(retriever);
-
         } catch (IOException e) {
-            Log.e(TAG, e.getMessage(), e);
+            Log.e(TAG, "Failed to set video data source from URL", e);
+            if (onVideoErrorListener != null) {
+                onVideoErrorListener.onVideoError("Failed to set data source from URL: " + e.getMessage());
+            }
+            return;
+        }
+
+        isDataSourceSet = true;
+        if (isSurfaceCreated) {
+            prepareAndStartMediaPlayer();
         }
     }
 
-  public void setVideoFromResourceId(Context context, int resId) {
-    reset();
-
-    try {
-      AssetFileDescriptor afd = context.getResources().openRawResourceFd(resId);
-      if (afd == null) return;
-
-      FileDescriptor fileDescriptor = afd.getFileDescriptor();
-      long startOffset = afd.getStartOffset();
-      long endOffset = afd.getLength();
-      mediaPlayer.setDataSource(fileDescriptor, startOffset, endOffset);
-
-      MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-      retriever.setDataSource(fileDescriptor, startOffset, endOffset);
-
-      onDataSourceSet(retriever);
-
-    } catch (IOException e) {
-      Log.e(TAG + " setVideoFromResourceId", e.getMessage(), e);
-    }
-  }
-
-    public void setVideoFromFile(FileDescriptor fileDescriptor) {
+    public void setVideoFromResourceId(Context context, int resId) {
         reset();
 
-        try {
-            mediaPlayer.setDataSource(fileDescriptor);
+        try (AssetFileDescriptor afd = context.getResources().openRawResourceFd(resId)) {
+            if (afd == null) {
+                Log.e(TAG, "Failed to open raw resource fd for resId: " + resId);
+                if (onVideoErrorListener != null) {
+                    onVideoErrorListener.onVideoError("Failed to open raw resource fd for resId: " + resId);
+                }
+                return;
+            }
 
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            retriever.setDataSource(fileDescriptor);
-
-            onDataSourceSet(retriever);
-
+            mediaPlayer.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
         } catch (IOException e) {
-            Log.e(TAG, e.getMessage(), e);
+            Log.e(TAG, "Failed to set video from resource", e);
+            if (onVideoErrorListener != null) {
+                onVideoErrorListener.onVideoError("Failed to set video from resource: " + e.getMessage());
+            }
+            return;
         }
-    }
 
-    public void setVideoFromFile(FileDescriptor fileDescriptor, int startOffset, int endOffset) {
-        reset();
-
-        try {
-            mediaPlayer.setDataSource(fileDescriptor, startOffset, endOffset);
-
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            retriever.setDataSource(fileDescriptor, startOffset, endOffset);
-
-            onDataSourceSet(retriever);
-
-        } catch (IOException e) {
-            Log.e(TAG, e.getMessage(), e);
-        }
-    }
-
-    @TargetApi(23)
-    public void setVideoFromMediaDataSource(MediaDataSource mediaDataSource) {
-        reset();
-
-        mediaPlayer.setDataSource(mediaDataSource);
-
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        retriever.setDataSource(mediaDataSource);
-
-        onDataSourceSet(retriever);
-    }
-
-    public void setVideoFromUri(Context context, Uri uri) {
-        reset();
-
-        try {
-            mediaPlayer.setDataSource(context, uri);
-
-            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-            retriever.setDataSource(context, uri);
-
-            onDataSourceSet(retriever);
-        } catch (IOException e) {
-            Log.e(TAG, e.getMessage(), e);
+        isDataSourceSet = true;
+        if (isSurfaceCreated) {
+            prepareAndStartMediaPlayer();
         }
     }
 
     @Override
     public void onResume() {
         super.onResume();
-        if (autoPlayAfterResume && playAfterResume) {
-            playAfterResume = false;
+        if (wasPlayingBeforePause) {
             start();
         }
     }
@@ -430,21 +211,16 @@ public class AlphaMovieView extends GLTextureView {
     @Override
     public void onPause() {
         super.onPause();
-        handler.removeCallbacks(timeDetector);
-        if (isPlaying() && autoPlayAfterResume) {
-            playAfterResume = true;
-        }
+        wasPlayingBeforePause = (state == PlayerState.STARTED);
         pause();
     }
 
     protected void cleanup() {
       release();
-      handler.removeCallbacks(timeDetector);
     }
 
     private void prepareAsync(final MediaPlayer.OnPreparedListener onPreparedListener) {
-        if (mediaPlayer != null && state == PlayerState.NOT_PREPARED
-                || state == PlayerState.STOPPED) {
+        if (mediaPlayer != null && state == PlayerState.NOT_PREPARED) {
             mediaPlayer.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
                 @Override
                 public void onPrepared(MediaPlayer mp) {
@@ -456,38 +232,13 @@ public class AlphaMovieView extends GLTextureView {
         }
     }
 
-    private void startTimeDetector() {
-        handler.postDelayed(timeDetector, TIME_DETECTION_INTERVAL_MS);
-    }
-
     public void start() {
         if (mediaPlayer != null) {
             switch (state) {
                 case PREPARED:
-                    mediaPlayer.start();
-                    startTimeDetector();
-                    state = PlayerState.STARTED;
-                    if (onVideoStartedListener != null) {
-                        onVideoStartedListener.onVideoStarted();
-                    }
-                    break;
                 case PAUSED:
                     mediaPlayer.start();
-                    startTimeDetector();
                     state = PlayerState.STARTED;
-                    break;
-                case STOPPED:
-                    prepareAsync(new MediaPlayer.OnPreparedListener() {
-                        @Override
-                        public void onPrepared(MediaPlayer mp) {
-                            mediaPlayer.start();
-                            startTimeDetector();
-                            state = PlayerState.STARTED;
-                            if (onVideoStartedListener != null) {
-                                onVideoStartedListener.onVideoStarted();
-                            }
-                        }
-                    });
                     break;
             }
         }
@@ -500,18 +251,12 @@ public class AlphaMovieView extends GLTextureView {
         }
     }
 
-    public void stop() {
-        if (mediaPlayer != null && (state == PlayerState.STARTED || state == PlayerState.PAUSED)) {
-            mediaPlayer.stop();
-            state = PlayerState.STOPPED;
-        }
-    }
-
     public void reset() {
-        if (mediaPlayer != null && (state == PlayerState.STARTED || state == PlayerState.PAUSED ||
-                state == PlayerState.STOPPED)) {
+        if (mediaPlayer != null && state != PlayerState.RELEASE) {
             mediaPlayer.reset();
+            isDataSourceSet = false;
             state = PlayerState.NOT_PREPARED;
+            applyVolume();
         }
     }
 
@@ -519,88 +264,62 @@ public class AlphaMovieView extends GLTextureView {
         if (mediaPlayer != null) {
             mediaPlayer.release();
             state = PlayerState.RELEASE;
+            super.onPause();
         }
-    }
-
-    public PlayerState getState() {
-        return state;
-    }
-
-    public boolean isPlaying() {
-        return state == PlayerState.STARTED;
-    }
-
-    public boolean isPaused() {
-        return state == PlayerState.PAUSED;
-    }
-
-    public boolean isStopped() {
-        return state == PlayerState.STOPPED;
-    }
-
-    public boolean isReleased() {
-        return state == PlayerState.RELEASE;
-    }
-
-    public void seekTo(int msec) {
-        mediaPlayer.seekTo(msec);
-    }
-
-    public void setLooping(boolean looping) {
-        this.shouldLoop = looping;
-        mediaPlayer.setLooping(looping);
     }
 
     public void setLoop(boolean loop) {
         this.shouldLoop = loop;
-        updateMediaPlayerLoopSetting();
-    }
-
-    public int getCurrentPosition() {
-        return mediaPlayer.getCurrentPosition();
-    }
-
-    public void setScreenOnWhilePlaying(boolean screenOn) {
-        mediaPlayer.setScreenOnWhilePlaying(screenOn);
-    }
-
-    public void setOnErrorListener(MediaPlayer.OnErrorListener onErrorListener){
-        mediaPlayer.setOnErrorListener(onErrorListener);
-    }
-
-    public void setOnVideoStartedListener(OnVideoStartedListener onVideoStartedListener) {
-        this.onVideoStartedListener = onVideoStartedListener;
     }
 
     public void setOnVideoEndedListener(OnVideoEndedListener onVideoEndedListener) {
         this.onVideoEndedListener = onVideoEndedListener;
     }
 
-    public void setOnSeekCompleteListener(MediaPlayer.OnSeekCompleteListener onSeekCompleteListener) {
-        mediaPlayer.setOnSeekCompleteListener(onSeekCompleteListener);
+    public void setAutoplay(boolean autoplay) {
+        this.autoplay = autoplay;
     }
 
-    public void setLoopSeekingMethod(int loopSeekingMethod) {
-        this.loopSeekingMethod = loopSeekingMethod;
+    public void setVolume(float volume) {
+        this.volume = Math.max(0f, Math.min(1f, volume));
+        applyVolume();
     }
 
-    public int getLoopSeekingMethod() {
-        return this.loopSeekingMethod;
+    public void setMuted(boolean muted) {
+        this.muted = muted;
+        applyVolume();
     }
 
-    public MediaPlayer getMediaPlayer() {
-        return mediaPlayer;
+    public void setPaused(boolean paused) {
+        this.startPaused = paused;
+        if (paused && state == PlayerState.STARTED) {
+            pause();
+        } else if (!paused && (state == PlayerState.PAUSED || state == PlayerState.PREPARED)) {
+            start();
+        }
     }
 
-    public interface OnVideoStartedListener {
-        void onVideoStarted();
+    public void setOnVideoLoadedListener(OnVideoLoadedListener onVideoLoadedListener) {
+        this.onVideoLoadedListener = onVideoLoadedListener;
+    }
+
+    public void setOnVideoErrorListener(OnVideoErrorListener onVideoErrorListener) {
+        this.onVideoErrorListener = onVideoErrorListener;
     }
 
     public interface OnVideoEndedListener {
         void onVideoEnded();
     }
 
+    public interface OnVideoLoadedListener {
+        void onVideoLoaded();
+    }
+
+    public interface OnVideoErrorListener {
+        void onVideoError(String errorMessage);
+    }
+
     private enum PlayerState {
-        NOT_PREPARED, PREPARED, STARTED, PAUSED, STOPPED, RELEASE
+        NOT_PREPARED, PREPARED, STARTED, PAUSED, RELEASE
     }
 }
