@@ -39,6 +39,9 @@ public class AlphaMovieView extends GLTextureView {
     private MediaPlayer mediaPlayer;
 
     private OnVideoEndedListener onVideoEndedListener;
+    private OnVideoLoadedListener onVideoLoadedListener;
+    private OnVideoErrorListener onVideoErrorListener;
+    private OnPlaybackStateChangeListener onPlaybackStateChangeListener;
 
     private boolean isSurfaceCreated;
     private boolean isDataSourceSet;
@@ -52,8 +55,13 @@ public class AlphaMovieView extends GLTextureView {
     private boolean autoplay = true;
     private boolean wasPlayingBeforePause = false;
 
-    private OnVideoLoadedListener onVideoLoadedListener;
-    private OnVideoErrorListener onVideoErrorListener;
+    // Cross-thread fields (MediaPlayer callbacks may run off main thread)
+    private volatile int bufferedPercent = 0;
+    private volatile int pendingSeekMs = -1;        // -1 = sin pending
+    private volatile Boolean pendingPaused = null;  // null = sin override
+
+    // Dedup state JS-side (synchronized via notifyPlaybackStateChange)
+    private String currentPlaybackState = "idle";
 
     public AlphaMovieView(Context context, AttributeSet attrs) {
         super(context, attrs);
@@ -85,7 +93,8 @@ public class AlphaMovieView extends GLTextureView {
         mediaPlayer = new MediaPlayer();
         mediaPlayer.setScreenOnWhilePlaying(true);
         applyVolume();
-        // Loop is handled manually in onCompletion to always emit onEnd
+        // Loop is handled manually in onCompletion to always emit onEnd.
+        // For loop=true, mp.start() bypasses our public start() so the loop is silent state-wise.
         mediaPlayer.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
             @Override
             public void onCompletion(MediaPlayer mp) {
@@ -97,6 +106,7 @@ public class AlphaMovieView extends GLTextureView {
                     mp.start();
                 } else {
                     state = PlayerState.PAUSED;
+                    notifyPlaybackStateChange("ended");
                 }
             }
         });
@@ -106,7 +116,25 @@ public class AlphaMovieView extends GLTextureView {
                 if (onVideoErrorListener != null) {
                     onVideoErrorListener.onVideoError("MediaPlayer error: what=" + what + " extra=" + extra);
                 }
+                notifyPlaybackStateChange("error");
                 return true;
+            }
+        });
+        mediaPlayer.setOnInfoListener(new MediaPlayer.OnInfoListener() {
+            @Override
+            public boolean onInfo(MediaPlayer mp, int what, int extra) {
+                if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
+                    notifyPlaybackStateChange("buffering");
+                } else if (what == MediaPlayer.MEDIA_INFO_BUFFERING_END) {
+                    notifyPlaybackStateChange(state == PlayerState.STARTED ? "playing" : "paused");
+                }
+                return false;
+            }
+        });
+        mediaPlayer.setOnBufferingUpdateListener(new MediaPlayer.OnBufferingUpdateListener() {
+            @Override
+            public void onBufferingUpdate(MediaPlayer mp, int percent) {
+                bufferedPercent = percent;
             }
         });
     }
@@ -142,12 +170,28 @@ public class AlphaMovieView extends GLTextureView {
                 if (onVideoLoadedListener != null) {
                     onVideoLoadedListener.onVideoLoaded();
                 }
-                // paused takes priority over autoplay
-                if (startPaused) {
-                    return;
+
+                // Apply pending seek BEFORE deciding play/pause
+                if (pendingSeekMs >= 0) {
+                    try { mp.seekTo(pendingSeekMs); } catch (IllegalStateException ignored) {}
+                    pendingSeekMs = -1;
                 }
-                if (autoplay) {
-                    start();
+
+                // Determine target play/pause: pendingPaused > startPaused > !autoplay
+                boolean shouldPause;
+                if (pendingPaused != null) {
+                    shouldPause = pendingPaused;
+                    pendingPaused = null;
+                } else if (startPaused) {
+                    shouldPause = true;
+                } else {
+                    shouldPause = !autoplay;
+                }
+
+                if (shouldPause) {
+                    notifyPlaybackStateChange("paused");
+                } else {
+                    start();  // emite "playing"
                 }
             }
         });
@@ -157,6 +201,13 @@ public class AlphaMovieView extends GLTextureView {
     public void setVideoByUrl(String url) {
         reset();
 
+        // OnBufferingUpdateListener no dispara para archivos locales — asumir 100%
+        if (url.startsWith("file://") || url.startsWith("/") || url.startsWith("content://")) {
+            bufferedPercent = 100;
+        } else {
+            bufferedPercent = 0;
+        }
+
         try {
             mediaPlayer.setDataSource(url);
         } catch (IOException e) {
@@ -164,6 +215,7 @@ public class AlphaMovieView extends GLTextureView {
             if (onVideoErrorListener != null) {
                 onVideoErrorListener.onVideoError("Failed to set data source from URL: " + e.getMessage());
             }
+            notifyPlaybackStateChange("error");
             return;
         }
 
@@ -175,6 +227,7 @@ public class AlphaMovieView extends GLTextureView {
 
     public void setVideoFromResourceId(Context context, int resId) {
         reset();
+        bufferedPercent = 100;  // siempre local
 
         try (AssetFileDescriptor afd = context.getResources().openRawResourceFd(resId)) {
             if (afd == null) {
@@ -182,6 +235,7 @@ public class AlphaMovieView extends GLTextureView {
                 if (onVideoErrorListener != null) {
                     onVideoErrorListener.onVideoError("Failed to open raw resource fd for resId: " + resId);
                 }
+                notifyPlaybackStateChange("error");
                 return;
             }
 
@@ -191,6 +245,7 @@ public class AlphaMovieView extends GLTextureView {
             if (onVideoErrorListener != null) {
                 onVideoErrorListener.onVideoError("Failed to set video from resource: " + e.getMessage());
             }
+            notifyPlaybackStateChange("error");
             return;
         }
 
@@ -239,6 +294,9 @@ public class AlphaMovieView extends GLTextureView {
                 case PAUSED:
                     mediaPlayer.start();
                     state = PlayerState.STARTED;
+                    notifyPlaybackStateChange("playing");
+                    break;
+                default:
                     break;
             }
         }
@@ -248,6 +306,7 @@ public class AlphaMovieView extends GLTextureView {
         if (mediaPlayer != null && state == PlayerState.STARTED) {
             mediaPlayer.pause();
             state = PlayerState.PAUSED;
+            notifyPlaybackStateChange("paused");
         }
     }
 
@@ -257,6 +316,7 @@ public class AlphaMovieView extends GLTextureView {
             isDataSourceSet = false;
             state = PlayerState.NOT_PREPARED;
             applyVolume();
+            // No emit state change — caller decides (ViewManager emite "loading")
         }
     }
 
@@ -292,10 +352,67 @@ public class AlphaMovieView extends GLTextureView {
 
     public void setPaused(boolean paused) {
         this.startPaused = paused;
-        if (paused && state == PlayerState.STARTED) {
+        applyPausedTarget(paused);
+    }
+
+    private void applyPausedTarget(boolean target) {
+        if (mediaPlayer == null || state == PlayerState.RELEASE) return;
+        if (state == PlayerState.NOT_PREPARED) {
+            pendingPaused = target;
+            return;
+        }
+        if (target && state == PlayerState.STARTED) {
             pause();
-        } else if (!paused && (state == PlayerState.PAUSED || state == PlayerState.PREPARED)) {
+        } else if (!target && (state == PlayerState.PREPARED || state == PlayerState.PAUSED)) {
             start();
+        }
+    }
+
+    // Imperative actions (called by ViewManager.receiveCommand)
+    public void requestPlay() { applyPausedTarget(false); }
+    public void requestPause() { applyPausedTarget(true); }
+
+    public void seekToMs(int ms) {
+        // toleranceMs (JS arg) no se usa en Android — MediaPlayer.seekTo no soporta tolerance API
+        if (mediaPlayer != null && (state == PlayerState.STARTED || state == PlayerState.PAUSED || state == PlayerState.PREPARED)) {
+            try { mediaPlayer.seekTo(ms); } catch (IllegalStateException ignored) {}
+        } else if (state == PlayerState.NOT_PREPARED) {
+            pendingSeekMs = ms;
+        }
+    }
+
+    // Getters used by ViewManager (progress ticker / onLoad payload)
+    public int getCurrentPositionMs() {
+        if (mediaPlayer != null && (state == PlayerState.STARTED || state == PlayerState.PAUSED)) {
+            try { return mediaPlayer.getCurrentPosition(); } catch (IllegalStateException e) { return 0; }
+        }
+        return 0;
+    }
+
+    public int getDurationMs() {
+        if (mediaPlayer != null && state != PlayerState.NOT_PREPARED && state != PlayerState.RELEASE) {
+            try { return mediaPlayer.getDuration(); } catch (IllegalStateException e) { return 0; }
+        }
+        return 0;
+    }
+
+    public int getBufferedPercent() { return bufferedPercent; }
+
+    public int getVideoWidth() { return mediaPlayer != null ? mediaPlayer.getVideoWidth() : 0; }
+    public int getVideoHeight() { return mediaPlayer != null ? mediaPlayer.getVideoHeight() : 0; }
+
+    public boolean isPlaying() { return state == PlayerState.STARTED; }
+
+    // Permite al ViewManager emitir "loading"/"error" externos sincronizando el dedup interno
+    public void notifyExternalState(String state) {
+        notifyPlaybackStateChange(state);
+    }
+
+    private synchronized void notifyPlaybackStateChange(String state) {
+        if (state.equals(currentPlaybackState)) return;
+        currentPlaybackState = state;
+        if (onPlaybackStateChangeListener != null) {
+            onPlaybackStateChangeListener.onPlaybackStateChange(state);
         }
     }
 
@@ -305,6 +422,10 @@ public class AlphaMovieView extends GLTextureView {
 
     public void setOnVideoErrorListener(OnVideoErrorListener onVideoErrorListener) {
         this.onVideoErrorListener = onVideoErrorListener;
+    }
+
+    public void setOnPlaybackStateChangeListener(OnPlaybackStateChangeListener listener) {
+        this.onPlaybackStateChangeListener = listener;
     }
 
     public interface OnVideoEndedListener {
@@ -317,6 +438,10 @@ public class AlphaMovieView extends GLTextureView {
 
     public interface OnVideoErrorListener {
         void onVideoError(String errorMessage);
+    }
+
+    public interface OnPlaybackStateChangeListener {
+        void onPlaybackStateChange(String state);
     }
 
     private enum PlayerState {

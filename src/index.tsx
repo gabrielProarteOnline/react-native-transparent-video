@@ -1,7 +1,47 @@
-import React, { forwardRef, useCallback } from 'react';
-import { Image } from 'react-native';
-import type { ImageSourcePropType, StyleProp, View, ViewStyle } from 'react-native';
+import React, {
+  forwardRef,
+  useCallback,
+  useImperativeHandle,
+  useRef,
+} from 'react';
+import { Image, UIManager, findNodeHandle } from 'react-native';
+import type {
+  ImageSourcePropType,
+  StyleProp,
+  View,
+  ViewStyle,
+} from 'react-native';
 import NativeTransparentVideoView from './NativeTransparentVideoSpec';
+
+export type PlaybackState =
+  | 'idle'
+  | 'loading'
+  | 'playing'
+  | 'paused'
+  | 'buffering'
+  | 'ended'
+  | 'error';
+
+export interface OnLoadEvent {
+  duration: number;
+  naturalSize: { width: number; height: number };
+}
+
+export interface OnProgressEvent {
+  currentTime: number;
+  duration: number;
+  playableDuration: number;
+}
+
+export interface OnPlaybackStateChangeEvent {
+  state: PlaybackState;
+}
+
+export interface TransparentVideoHandle {
+  seek: (time: number, toleranceMs?: number) => void;
+  play: () => void;
+  pause: () => void;
+}
 
 export interface TransparentVideoProps {
   style?: StyleProp<ViewStyle>;
@@ -11,12 +51,20 @@ export interface TransparentVideoProps {
   muted?: boolean;
   volume?: number;
   paused?: boolean;
+  progressUpdateInterval?: number;
   onEnd?: () => void;
-  onLoad?: () => void;
+  onLoad?: (event: OnLoadEvent) => void;
+  onProgress?: (event: OnProgressEvent) => void;
+  onPlaybackStateChange?: (event: OnPlaybackStateChangeEvent) => void;
   onError?: (error: { message: string }) => void;
 }
 
-const TransparentVideo = forwardRef<View, TransparentVideoProps>(
+const DEFAULT_SEEK_TOLERANCE_MS = 100;
+
+const TransparentVideo = forwardRef<
+  TransparentVideoHandle,
+  TransparentVideoProps
+>(
   (
     {
       source,
@@ -26,12 +74,48 @@ const TransparentVideo = forwardRef<View, TransparentVideoProps>(
       muted = false,
       volume = 1.0,
       paused = false,
+      progressUpdateInterval = 250,
       onEnd,
       onLoad,
+      onProgress,
+      onPlaybackStateChange,
       onError,
     },
     ref
   ) => {
+    const nativeRef = useRef<View>(null);
+
+    useImperativeHandle(
+      ref,
+      () => ({
+        seek: (time: number, toleranceMs: number = DEFAULT_SEEK_TOLERANCE_MS) => {
+          const node = findNodeHandle(nativeRef.current);
+          if (node == null) {
+            return;
+          }
+          UIManager.dispatchViewManagerCommand(node, 'seek', [
+            time,
+            toleranceMs,
+          ]);
+        },
+        play: () => {
+          const node = findNodeHandle(nativeRef.current);
+          if (node == null) {
+            return;
+          }
+          UIManager.dispatchViewManagerCommand(node, 'play', []);
+        },
+        pause: () => {
+          const node = findNodeHandle(nativeRef.current);
+          if (node == null) {
+            return;
+          }
+          UIManager.dispatchViewManagerCommand(node, 'pause', []);
+        },
+      }),
+      []
+    );
+
     const resolvedSource = Image.resolveAssetSource(source) || source || {};
     let uri = resolvedSource.uri || '';
     if (uri && uri.match(/^\//)) {
@@ -45,9 +129,30 @@ const TransparentVideo = forwardRef<View, TransparentVideoProps>(
       [onError]
     );
 
+    const handleLoad = useCallback(
+      (event: { nativeEvent: OnLoadEvent }) => {
+        onLoad?.(event.nativeEvent);
+      },
+      [onLoad]
+    );
+
+    const handleProgress = useCallback(
+      (event: { nativeEvent: OnProgressEvent }) => {
+        onProgress?.(event.nativeEvent);
+      },
+      [onProgress]
+    );
+
+    const handlePlaybackStateChange = useCallback(
+      (event: { nativeEvent: OnPlaybackStateChangeEvent }) => {
+        onPlaybackStateChange?.(event.nativeEvent);
+      },
+      [onPlaybackStateChange]
+    );
+
     return (
       <NativeTransparentVideoView
-        ref={ref}
+        ref={nativeRef}
         style={style}
         src={{ uri }}
         autoplay={autoplay}
@@ -55,8 +160,13 @@ const TransparentVideo = forwardRef<View, TransparentVideoProps>(
         muted={muted}
         volume={volume}
         paused={paused}
+        progressUpdateInterval={progressUpdateInterval}
         onEnd={onEnd}
-        onLoad={onLoad}
+        onLoad={onLoad ? handleLoad : undefined}
+        onProgress={onProgress ? handleProgress : undefined}
+        onPlaybackStateChange={
+          onPlaybackStateChange ? handlePlaybackStateChange : undefined
+        }
         onError={onError ? handleError : undefined}
       />
     );
