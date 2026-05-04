@@ -1452,7 +1452,7 @@ public class GLTextureView
                 try {
                     GLTextureView view = mGLSurfaceViewWeakRef.get();
                     if (view != null) {
-                        view.mRenderer.onSurfaceDestroyed(gl);
+                        view.mRenderer.onSurfaceDestroyed(null);
                     }
                 } catch (Exception e) {
                     Log.w("GLThread", "onSurfaceDestroyed failed", e);
