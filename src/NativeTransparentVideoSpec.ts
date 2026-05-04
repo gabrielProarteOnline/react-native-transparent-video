@@ -10,14 +10,12 @@ type SrcType = Readonly<{
   uri: string;
 }>;
 
-type NaturalSize = Readonly<{
-  width: Double;
-  height: Double;
-}>;
-
 type OnLoadEventPayload = Readonly<{
   duration: Double;
-  naturalSize: NaturalSize;
+  naturalSize: Readonly<{
+    width: Double;
+    height: Double;
+  }>;
 }>;
 
 type OnProgressEventPayload = Readonly<{
